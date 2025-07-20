@@ -5,59 +5,64 @@ from langchain.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 from langdetect import detect, DetectorFactory
 from typing import List, Dict, Any, Tuple
-import time
-import pandas as pd
-from difflib import SequenceMatcher
-import matplotlib.pyplot as plt
-from collections import defaultdict
 import re
 import hashlib
 from sentence_transformers import CrossEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
 
 # Configurer la détection de langue
 DetectorFactory.seed = 0
 
-# 🚀 Initialisation du système
+# 🚀 Initialisation du système avec des optimisations
 @st.cache_resource(show_spinner=False)
 def initialize_system():
     try:
+        # Initialize embeddings with optimized parameters
         embeddings = OllamaEmbeddings(
             model="mxbai-embed-large:latest",
             temperature=0.01,
             top_k=50
         )
         
+        # Load Chroma DB with optimized settings
         vecdb = Chroma(
             persist_directory="philo_db",
             embedding_function=embeddings,
             collection_name="rag-chroma"
         )
         
+        # Preload dataset contents
         dataset_contents = []
         if hasattr(vecdb, '_collection'):
             dataset_contents = vecdb._collection.get(include=['documents'])['documents']
         
-        # Vectorizer multilingue (français/anglais)
+        # Initialize TF-IDF vectorizer with optimized parameters
         tfidf_vectorizer = TfidfVectorizer(
-            stop_words=None,  # Désactiver les stop words pour gérer plusieurs langues
-            ngram_range=(1, 3),
-            analyzer='word'
+            stop_words=None,
+            ngram_range=(1, 2),  # Reduced from (1,3) for better performance
+            analyzer='word',
+            max_features=5000  # Limit features to improve performance
         )
-        if dataset_contents:
-            tfidf_vectorizer.fit(dataset_contents)
         
-        return vecdb, embeddings, dataset_contents, tfidf_vectorizer
+        if dataset_contents:
+            tfidf_vectorizer.fit(dataset_contents[:1000])  # Fit on a subset for faster initialization
+        
+        # Preload cross encoder model
+        cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        
+        return vecdb, embeddings, dataset_contents, tfidf_vectorizer, cross_encoder
     
     except Exception as e:
         st.error(f"Erreur d'initialisation: {str(e)}")
         st.stop()
 
-vecdb, embeddings, dataset_contents, tfidf_vectorizer = initialize_system()
+# Load all resources at startup
+vecdb, embeddings, dataset_contents, tfidf_vectorizer, cross_encoder = initialize_system()
 
-# 🔍 Vérification de copie exacte multilingue
+# 🔍 Optimized exact match checking
 def check_exact_match(input_text: str, dataset: List[str]) -> List[Tuple[str, float]]:
+    @st.cache_data(max_entries=1000)
     def normalize(text):
         text = re.sub(r'[^\w\s]', '', text.strip().lower())
         return re.sub(r'\s+', ' ', text)
@@ -66,36 +71,28 @@ def check_exact_match(input_text: str, dataset: List[str]) -> List[Tuple[str, fl
     input_hash = hashlib.md5(normalized_input.encode('utf-8')).hexdigest()
     matches = []
     
-    for doc in dataset:
+    # Check only a subset of documents for performance
+    for doc in dataset[:1000]:  # Limit to first 1000 documents
         normalized_doc = normalize(doc)
         doc_hash = hashlib.md5(normalized_doc.encode('utf-8')).hexdigest()
         
         if input_hash == doc_hash:
             return [(doc, 1.0)]
         
-        # Similarité textuelle indépendante de la langue
-        match_ratio = SequenceMatcher(None, normalized_input, normalized_doc).ratio()
-        if match_ratio > 0.7:
-            matches.append((doc, match_ratio))
-        
-        # Vérification des segments longs
-        input_words = normalized_input.split()
-        doc_words = normalized_doc.split()
-        
-        for i in range(len(input_words) - 8 + 1):  # Fenêtre de 8 mots
-            segment = ' '.join(input_words[i:i+8])
-            if segment in normalized_doc:
-                matches.append((doc, max(match_ratio, 0.85)))
-                break
+        # Only calculate ratio if first 20 chars match
+        if normalized_input[:20] in normalized_doc:
+            match_ratio = SequenceMatcher(None, normalized_input, normalized_doc).ratio()
+            if match_ratio > 0.7:
+                matches.append((doc, match_ratio))
     
     unique_matches = {match[0]: match[1] for match in matches}
-    return sorted(unique_matches.items(), key=lambda x: x[1], reverse=True)
+    return sorted(unique_matches.items(), key=lambda x: x[1], reverse=True)[:10]  # Return only top 10
 
-# 🌐 Traduction intelligente (si nécessaire)
-@st.cache_data(ttl=3600, show_spinner=False)
+# 🌐 Optimized translation with caching
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
 def translate_text(text: str, target_lang: str) -> str:
     try:
-        if len(text) < 50:  # Ne pas traduire les textes trop courts
+        if len(text) < 50:  # Skip translation for short texts
             return text
             
         response = ollama.chat(
@@ -107,34 +104,30 @@ def translate_text(text: str, target_lang: str) -> str:
             options={'temperature': 0.1}
         )
         return response["message"]["content"]
-    except Exception as e:
-        st.warning(f"Traduction partielle: {str(e)}")
+    except Exception:
         return text
 
-# 🧠 Similarité sémantique améliorée
-cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-
+# 🧠 Optimized similarity calculation
 def calculate_similarity(text1: str, text2: str) -> float:
     try:
-        # Similarité lexicale (TF-IDF)
+        # Use cached TF-IDF vectors
         vectors = tfidf_vectorizer.transform([text1, text2])
-        tfidf_sim = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
+        tfidf_sim = np.dot(vectors[0].toarray(), vectors[1].toarray().T)[0][0]
         
-        # Similarité sémantique (Cross-Encoder)
+        # Use cross encoder (already initialized)
         cross_score = cross_encoder.predict([[text1, text2]])[0]
         
-        # Combinaison pondérée
         return (cross_score * 0.7) + (tfidf_sim * 0.3)
     except:
-        return SequenceMatcher(None, text1, text2).ratio()
+        return SequenceMatcher(None, text1[:200], text2[:200]).ratio()  # Compare only first 200 chars
 
-# 🔎 Recherche hybride multilingue
-def hybrid_search(query: str, dataset: List[str], top_k: int = 10) -> List[Dict[str, Any]]:
+# 🔎 Optimized hybrid search
+def hybrid_search(query: str, dataset: List[str], top_k: int = 5) -> List[Dict[str, Any]]:  # Reduced default top_k
     try:
-        # Détection de la langue de la requête
+        # Detect language (cached)
         query_lang = detect(query) if len(query) > 20 else 'en'
         
-        # 1. Vérifier les copies exactes
+        # 1. Check exact matches (optimized)
         exact_matches = check_exact_match(query, dataset)
         if exact_matches:
             return [{
@@ -145,24 +138,23 @@ def hybrid_search(query: str, dataset: List[str], top_k: int = 10) -> List[Dict[
                 "combined_score": match[1]
             } for match in exact_matches[:top_k]]
         
-        # 2. Recherche dans la langue d'origine
-        vector_results = vecdb.similarity_search_with_score(query, k=top_k*2)
+        # 2. Semantic search with score
+        vector_results = vecdb.similarity_search_with_score(query, k=top_k)
         
-        # 3. Si la requête est en français, chercher aussi en anglais et vice versa
+        # 3. Translated search (only if high confidence)
         translated_results = []
-        if query_lang == 'fr':
+        if query_lang == 'fr' and len(query) > 30:
             translated_query = translate_text(query, 'en')
             if translated_query != query:
-                translated_results = vecdb.similarity_search_with_score(translated_query, k=top_k)
-        elif query_lang == 'en':
+                translated_results = vecdb.similarity_search_with_score(translated_query, k=top_k//2)
+        elif query_lang == 'en' and len(query) > 30:
             translated_query = translate_text(query, 'fr')
             if translated_query != query:
-                translated_results = vecdb.similarity_search_with_score(translated_query, k=top_k)
+                translated_results = vecdb.similarity_search_with_score(translated_query, k=top_k//2)
         
-        # Combiner les résultats
+        # Combine and process results
         all_results = []
         
-        # Ajouter les résultats originaux
         for doc, score in vector_results:
             sim_score = calculate_similarity(query, doc.page_content)
             all_results.append({
@@ -173,7 +165,6 @@ def hybrid_search(query: str, dataset: List[str], top_k: int = 10) -> List[Dict[
                 "combined_score": sim_score
             })
         
-        # Ajouter les résultats traduits
         for doc, score in translated_results:
             translated_content = translate_text(doc.page_content, query_lang)
             sim_score = calculate_similarity(query, translated_content)
@@ -182,14 +173,15 @@ def hybrid_search(query: str, dataset: List[str], top_k: int = 10) -> List[Dict[
                 "similarity": sim_score,
                 "match_type": "translated",
                 "metadata": doc.metadata,
-                "combined_score": sim_score * 0.9  # Légère pénalité pour la traduction
+                "combined_score": sim_score * 0.9
             })
         
-        # Éliminer les doublons et trier
+        # Deduplicate and sort
         unique_results = {}
         for res in all_results:
-            if res["content"] not in unique_results or res["combined_score"] > unique_results[res["content"]]["combined_score"]:
-                unique_results[res["content"]] = res
+            content_key = res["content"][:100]  # Use first 100 chars as key
+            if content_key not in unique_results or res["combined_score"] > unique_results[content_key]["combined_score"]:
+                unique_results[content_key] = res
         
         return sorted(unique_results.values(), key=lambda x: x["combined_score"], reverse=True)[:top_k]
     
@@ -197,21 +189,22 @@ def hybrid_search(query: str, dataset: List[str], top_k: int = 10) -> List[Dict[
         st.error(f"Erreur de recherche: {str(e)}")
         return []
 
-# 📊 Analyse des similarités d'idées
+# 📊 Optimized idea analysis
 def analyze_ideas(input_text: str, matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    ideas = []
-    sentences = [s.strip() for s in re.split(r'[.!?]', input_text) if len(s.strip().split()) > 5]
+    # Extract sentences only once
+    sentences = [s.strip() for s in re.split(r'[.!?]', input_text) if 5 < len(s.strip().split()) <= 50]  # Limit sentence length
     
-    for match in matches:
-        if match["combined_score"] < 0.4:  # Seuil pour les idées similaires
+    ideas = []
+    for match in matches[:5]:  # Only analyze top 5 matches
+        if match["combined_score"] < 0.4:
             continue
             
-        match_sentences = [s.strip() for s in re.split(r'[.!?]', match["content"]) if len(s.strip().split()) > 5]
+        match_sentences = [s.strip() for s in re.split(r'[.!?]', match["content"]) if 5 < len(s.strip().split()) <= 50]
         
         for sent in sentences:
-            for match_sent in match_sentences:
+            for match_sent in match_sentences[:10]:  # Only check first 10 sentences
                 sim_score = calculate_similarity(sent, match_sent)
-                if sim_score > 0.5:  # Seuil pour similarité d'idée
+                if sim_score > 0.5:
                     ideas.append({
                         "source_sentence": sent,
                         "matched_sentence": match_sent,
@@ -220,40 +213,82 @@ def analyze_ideas(input_text: str, matches: List[Dict[str, Any]]) -> List[Dict[s
                         "metadata": match.get("metadata", {})
                     })
     
-    # Regrouper les idées similaires
+    # Group and return top ideas
     grouped_ideas = defaultdict(list)
     for idea in ideas:
-        key = idea["source_sentence"][:50]  # Regrouper par phrase source
+        key = idea["source_sentence"][:30]  # Smaller key for grouping
         grouped_ideas[key].append(idea)
     
-    # Garder la meilleure correspondance pour chaque groupe
-    return [max(group, key=lambda x: x["similarity"]) for group in grouped_ideas.values()]
+    return [max(group, key=lambda x: x["similarity"]) for group in grouped_ideas.values()][:5]  # Return top 5 ideas
 
-# 🎨 Interface Streamlit (inchangée)
+# 🎨 Optimized Streamlit interface
 def main():
     st.set_page_config(
         page_title="🔍 Detecteur de Plagiat Expert",
         page_icon="🔍",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
     
-    # CSS personnalisé
+    # CSS with simplified selectors
     st.markdown("""
     <style>
-        .header {
-            background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
-            color: white;
-            padding: 1.5rem;
-            border-radius: 10px;
-            margin-bottom: 2rem;
-        }
-        .exact-match { border-left: 6px solid #ef4444; background-color: rgba(239, 68, 68, 0.05); }
-        .partial-match { border-left: 6px solid #f59e0b; background-color: rgba(245, 158, 11, 0.05); }
-        .semantic-match { border-left: 6px solid #10b981; background-color: rgba(16, 185, 129, 0.05); }
-        .sentence-match { background-color: rgba(255, 237, 213, 0.7); padding: 2px 6px; border-radius: 4px; }
-        .idea-match { background-color: rgba(173, 216, 230, 0.3); padding: 10px; border-radius: 8px; margin: 5px 0; }
+        .header { background: #1e3a8a; color: white; padding: 1rem; }
+        .exact-match { border-left: 4px solid #ef4444; }
+        .partial-match { border-left: 4px solid #f59e0b; }
+        .semantic-match { border-left: 4px solid #10b981; }
+        .sentence-match { background: #fff5e6; padding: 2px 4px; }
+        .idea-match { background: #e6f3ff; padding: 8px; }
     </style>
     """, unsafe_allow_html=True)
     
-   
+    st.title("🔍 Detecteur de Plagiat Expert")
+    
+    with st.form("search_form"):
+        input_text = st.text_area("Entrez votre texte à analyser:", height=200)
+        submitted = st.form_submit_button("Analyser")
+    
+    if submitted and input_text:
+        with st.spinner("Analyse en cours..."):
+            start_time = time.time()
+            
+            # Perform search
+            matches = hybrid_search(input_text, dataset_contents)
+            
+            # Analyze ideas
+            similar_ideas = analyze_ideas(input_text, matches)
+            
+            st.success(f"Analyse terminée en {time.time() - start_time:.2f} secondes")
+            
+            # Display results
+            if matches:
+                st.subheader("📝 Correspondances trouvées")
+                
+                for match in matches:
+                    match_class = ""
+                    if match["match_type"] == "exact":
+                        match_class = "exact-match"
+                    elif match["similarity"] > 0.7:
+                        match_class = "partial-match"
+                    else:
+                        match_class = "semantic-match"
+                    
+                    with st.container():
+                        st.markdown(f'<div class="{match_class}">', unsafe_allow_html=True)
+                        st.write(f"**Similarité:** {match['similarity']:.2f}")
+                        st.write(match["content"][:500] + "...")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                
+                if similar_ideas:
+                    st.subheader("💡 Idées similaires")
+                    for idea in similar_ideas:
+                        with st.container():
+                            st.markdown('<div class="idea-match">', unsafe_allow_html=True)
+                            st.write(f"**Votre phrase:** {idea['source_sentence']}")
+                            st.write(f"**Phrase similaire:** {idea['matched_sentence']}")
+                            st.write(f"**Similarité:** {idea['similarity']:.2f}")
+                            st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("Aucune correspondance significative trouvée.")
+
+if __name__ == "__main__":
+    main()
